@@ -1,0 +1,10 @@
+*.mat
+training_data/
+kstestproblem/
+latentRepr/dither/
+latentRepr/images/
+latentRepr/training_data/
+latentRepr/dumps/
+*.png
+*.dat
+*.gif
