@@ -25,13 +25,15 @@ from scipy import ndimage, misc, signal, stats
 ### Settings ###
 EPOCHS = 1000
 
-batchSize = 256
+batchSize = 16
 
 exactDefects = 12
 
 sortLossCoeff = 0.1
 
 powerFitCount = 5
+
+doSparse = True
 
 ### /Settings ###
 
@@ -111,13 +113,13 @@ testTrajDataset = (tf.data.Dataset
   .map(sortAlongDefects)
   .shuffle(100))
 
-for traj in list(testTrajDataset.as_numpy_iterator()):
-  print(traj.shape)
+#for traj in list(testTrajDataset.as_numpy_iterator()):
+  #print(traj.shape)
 
 #print(fromMatlabDataset)
 #print(list(fromMatlabDataset.map(lambda x: tf.math.count_nonzero(x[:,:,0])).as_numpy_iterator()))
 #print(list(fromMatlabDataset.map(lambda x: x[:,0,0]).as_numpy_iterator()))
-print(fromMatlabDataset)
+#print(fromMatlabDataset)
 
 positionKern = [0,1,0.0]
 timeDifferenceKern = [-0.5,0,0.5]
@@ -279,8 +281,9 @@ class SymbolicModel(Model):
     for coup in [self.diffsCoupling,self.hessCoupling,self.chargeShareCoupling]:
       # Coupling normalization loss
       lossAmt += tf.abs(1. - tf.math.reduce_sum(tf.abs(getKern(coup))))
-      # Coupling sparsification loss
-      lossAmt += tf.math.reduce_sum(0.8 * tf.math.sin(np.math.pi * tf.math.minimum(1.,5. * tf.abs(getKern(coup)))),-1)
+      if doSparse:
+        # Coupling sparsification loss
+        lossAmt += tf.math.reduce_sum(0.8 * tf.math.sin(np.math.pi * tf.math.minimum(1.,5. * tf.abs(getKern(coup)))),-1)
 
     return lossAmt
 
@@ -295,8 +298,9 @@ class SymbolicModel(Model):
 
     for n,coup in [("diff",self.diffsCoupling),("hess",self.hessCoupling),("chrg",self.chargeShareCoupling)]:
       print("Coupling normalization loss (" + n + ") ",tf.abs(1. - tf.math.reduce_sum(tf.abs(getKern(coup)))).numpy())
-      sparseLoss = tf.math.reduce_sum(0.8 * tf.math.sin(np.math.pi * tf.math.minimum(1.,5. * tf.abs(getKern(coup)))),-1)
-      print("Coupling sparsification loss (" + n + ") ",sparseLoss.numpy())
+      if doSparse:
+        sparseLoss = tf.math.reduce_sum(0.8 * tf.math.sin(np.math.pi * tf.math.minimum(1.,5. * tf.abs(getKern(coup)))),-1)
+        print("Coupling sparsification loss (" + n + ") ",sparseLoss.numpy())
 
   def explainYourself(self):
     strOut = "\n{:.3e} dqdt\n{:.3e}[".format(getKern(self.composite)[0].numpy(),getKern(self.composite)[1].numpy())
@@ -366,29 +370,49 @@ def trainThis(model,trainDir,lossFn,getFeat,getLabel,doViz,trainSet,testSet):
   latest = tf.train.latest_checkpoint(checkpoint_dir)
   model.load_weights(latest)
 
+  trainTicks = 0
+  for x in trainSet:
+    trainTicks += 1
+
+  testTicks = 0
+  for x in testSet:
+    testTicks += 1
+
+  cs = ["'","\b`","\b\"","\b\\","\b=","\b-","\b,","\b."]
+  csb = [".","\b,","\b-","\b=","\b/","\b\"","\b`","\b'"]
+  csn = 8
+
+  bst = "[" + (1 + trainTicks // csn) * " " + "]" + (2 + trainTicks // csn) * "\b"
+  bstb = "[" + (1 + testTicks // csn) * " " + "]" + (2 + testTicks // csn) * "\b"
+
   for epoch in range(EPOCHS):
     # Reset the metrics at the start of the next epoch
     train_loss.reset_states()
     test_loss.reset_states()
 
+    k = 0
+    print(bst,end="",flush=True)
     for original in trainSet:
       # Progess bar
-      print(".",end="",flush=True)
+      print(cs[k],end="",flush=True)
+      k = (k + 1) % csn
       train_step(original)
 
     print()
+    print(bstb,end="",flush=True)
+    k = 0
+    for test_orig in testSet:
+      print(csb[k],end="",flush=True)
+      k = (k + 1) % csn
+      test_step(test_orig)
 
     vizEpochs = 15
-    vized = False
-    for test_orig in testSet:
-      print("'",end="",flush=True)
-      test_step(test_orig)
-      # Also vizualize on last epoch
-      if not vized and ((epoch % vizEpochs == 0) or (epoch == EPOCHS - 1)):
-        print("\b\"",end="",flush=True)
-        doViz(model,test_orig,epoch)
-        model.save_weights(checkpoint_path.format(epoch=epoch))
-        vized = True
+    # Also vizualize on last epoch
+    if ((epoch % vizEpochs == 0) or (epoch == EPOCHS - 1)):
+      print("\b!",end="",flush=True)
+      doViz(model,test_orig,epoch)
+      model.save_weights(checkpoint_path.format(epoch=epoch))
+      vized = True
     print()
     print(
       f'Epoch {epoch}, '
