@@ -13,4 +13,6 @@ options.npu = 2^7;  % number of time steps per time unit
 options.Lt = 1/30;   % number of (dimensionless) time units to integrate
 
 domain = dom.KolmogorovDomainObject(options);
-%endState = load("R40_turbulent_state_k1.mat","s");
+global endState
+load("R40_turbulent_state_k1.mat","s");
+endState = s;

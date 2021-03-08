@@ -25,9 +25,13 @@ from scipy import ndimage, misc, signal, stats
 ### Settings ###
 EPOCHS = 1000
 
-batchSize = 128
+batchSize = 256
 
 exactDefects = 12
+
+sortLossCoeff = 0.1
+
+powerFitCount = 5
 
 ### /Settings ###
 
@@ -38,30 +42,78 @@ def intGenerator():
   eng.addpath(eng.genpath(r'C:\Users\Sam\Documents\MATLAB\KolmogorovDefects\Utility'))
   eng.addpath(r'C:\Users\Sam\Documents\MATLAB\KolmogorovDefects\src')
   eng.workspace['domain'] = eng.getDomain()
-  eng.workspace['endState'] = eng.load("R40_turbulent_state_k1.mat","s")['s']
-
+  #eng.workspace['endState'] = eng.load("R40_turbulent_state_k1.mat","s")['s']
+  
+  k = 0
   while True:
-    defectDatums = []
-    while True:
-      print("Integrating...")
-      defectData = eng.eval("getDefects(domain,endState)")
-      if len(defectData) == exactDefects:
-        defectDatums.append(defectData)
-        eng.workspace['endState'] = eng.eval("stepIntegrate(0.01,domain,endState)")
-      else:
-        print("Skipping region with (" + str(len(defectData)) + ") defects...")
-        eng.workspace['endState'] = eng.eval("stepIntegrate(2,domain,endState)")
-        break
-    if len(defectDatums) > 0:
-      yield defectDatums
+    print("Leap " + str(k))
+    k = k + 1
+    yield eng.eval("leapIntegrate(0.01,2," + str(exactDefects) + ",domain);")
+
+  #while True:
+    #defectDatums = []
+    #while True:
+      #print("Integrating...")
+      #defectData = eng.eval("getDefects(domain,endState)")
+      #if len(defectData) == exactDefects:
+        #defectDatums.append(defectData)
+        #eng.workspace['endState'] = eng.eval("stepIntegrate(0.01,domain,endState)")
+      #else:
+        #print("Skipping region with (" + str(len(defectData)) + ") defects...")
+        #eng.workspace['endState'] = eng.eval("stepIntegrate(2,domain,endState)")
+        #break
+    #if len(defectDatums) > 0:
+      #yield defectDatums
 
 timeSliceSize = 3
 fromMatlabDataset = (tf.data.Dataset
   .from_generator(intGenerator,output_signature = tf.TensorSpec(shape=(None,exactDefects,7), dtype=tf.float32))
   .flat_map(lambda x: tf.data.Dataset.from_tensor_slices(x).batch(timeSliceSize,drop_remainder=True))
   .prefetch(10)
-  .take(10000)
-  .cache(filename='training_data_DefectData/matlabAutocache'))
+  .take(50000)
+  .cache(filename='training_data_DefectData/defects50k'))
+
+def squishToTwoPi(x):
+  return tf.math.floormod(x[...,:2],2 * np.math.pi)
+
+# Expects defects in second to last dimension
+def sortDefects(left,right):
+  leftExpand = tf.repeat(tf.expand_dims(left,-2),exactDefects,axis=-2)
+  diffs = squishToTwoPi(tf.abs(leftExpand - tf.expand_dims(right,-3)))
+  nearness = tf.math.reduce_sum(diffs * diffs,-1)
+  argmins = tf.argmin(nearness,1)
+  fixedRight = tf.gather(right,argmins)
+  #debugSorter = True
+  #if debugSorter:
+    #maxOrigDiff = tf.math.reduce_max(tf.math.reduce_sum((left[...,:2] - right[...,:2]) * (left[...,:2] - right[...,:2]),-1),-1)
+    #if (maxOrigDiff > 0.2) or (tf.math.reduce_sum(tf.abs(argmins - np.arange(exactDefects)),-1).numpy() > 0):
+      #print("Left",left[...,:3])
+      #print("Right",right[...,:3])
+      #print("nearness",nearness)
+      #print("argmins",argmins)
+      #print("fixedRight",fixedRight[...,:3])
+      #print("maxOrigDiff",maxOrigDiff)
+  return fixedRight
+
+def sortAlongDefects(xsTensor):
+  #xs = tf.unstack(xsTensor)
+  return tf.scan(sortDefects, xsTensor)
+  #out = []
+  #out.append(xs[0])
+  #for i in range(len(xs)-1):
+    #out.append(sortDefects(out[i],xs[i+1]))
+  #return tf.stack(out,0)
+
+testTrajDataset = (tf.data.Dataset
+  .from_generator(intGenerator,output_signature = tf.TensorSpec(shape=(None,exactDefects,7), dtype=tf.float32))
+  .take(10)
+  .cache(filename='training_data_DefectData/defectTestTrajectories10')
+  .map(sortAlongDefects)
+  .shuffle(100))
+
+for traj in list(testTrajDataset.as_numpy_iterator()):
+  print(traj.shape)
+
 #print(fromMatlabDataset)
 #print(list(fromMatlabDataset.map(lambda x: tf.math.count_nonzero(x[:,:,0])).as_numpy_iterator()))
 #print(list(fromMatlabDataset.map(lambda x: x[:,0,0]).as_numpy_iterator()))
@@ -72,7 +124,7 @@ timeDifferenceKern = [-0.5,0,0.5]
 timeSecondDifferenceKern = [1,-2,1.0]
 
 def safePow(a,b):
-  return tf.math.sign(a) * tf.math.pow(tf.math.maximum(tf.abs(a),0.001),b)
+  return tf.math.sign(a) * tf.math.pow(tf.math.maximum(tf.abs(a),0.00000000000001),b)
 
 def buildTerm(x,exponents):
   timeKernels = tf.stack([positionKern,timeDifferenceKern,timeSecondDifferenceKern],axis=0)
@@ -91,21 +143,77 @@ def termMatrix(varCount,opCount,v,o):
   m = tf.reshape(m,[varCount,opCount])
   return m
 
-stateDataset = fromMatlabDataset.batch(batchSize).shuffle(10000)
+def takeDotProducts(vecs):
+  n = len(vecs)
+  upperTriangle = []
+  for i in range(n):
+    for j in range(i,n):
+      upperTriangle.append(tf.einsum("...i,...i->...",vecs[i],vecs[j]))
+  return upperTriangle
+
+def getKern(dns):
+  return tf.squeeze(dns(tf.constant(1.0,shape=[1,1])))
+
+stateDataset = fromMatlabDataset.map(sortAlongDefects).batch(batchSize).cache("training_data_DefectData/batchedAndSorted50k").shuffle(10000)
 trainStates = stateDataset.shard(2,0)
 testStates = stateDataset.shard(2,1)
 
 class SymbolicModel(Model):
   def __init__(self):
     super(SymbolicModel,self).__init__()
-    #self.inputLayer = Input(shape=(3,))
     self.varCount = 7
     self.timeOrder = 2 + 1
-    self.coeffs = Dense(1,input_dim=8,use_bias=False)
-    self.extraTermStorage = Dense(4*self.varCount*self.timeOrder,input_dim=1,use_bias=False,name='extraTerms')
+    self.composite = Dense(3,input_dim=1,use_bias=False)
+    self.diffNormExps = Dense(powerFitCount,input_dim=1,use_bias=False)
+    self.diffNormExpsHess = Dense(powerFitCount,input_dim=1,use_bias=False)
+    self.diffsCoupling = Dense(powerFitCount,input_dim=1,use_bias=False)
+    self.hessCoupling = Dense(powerFitCount,input_dim=1,use_bias=False)
 
-  def call(self,x):
+    self.compositeHess = Dense(2,input_dim=1,use_bias=False)
+    self.chargeShareExps = Dense(powerFitCount,input_dim=1,use_bias=False)
+    self.chargeShareCoupling = Dense(powerFitCount,input_dim=1,use_bias=False)
+    #self.extraTermStorage = Dense(4*self.varCount*self.timeOrder,input_dim=1,use_bias=False,name='extraTerms')
+
+  def timeIntegrate(self,defectState):
+    eqn = self.getEqn(defectState)[0]
+    comp = getKern(self.composite)
+    compositeMinusTime = comp - tf.one_hot(1,3) * comp
+    timeDeriv = tf.math.reduce_sum(tf.math.divide_no_nan(tf.einsum("i,...i->...",compositeMinusTime,eqn),comp[0]),axis=2)
+    return tf.squeeze(timeDeriv)
+
+  def timeIntegrateHess(self,defectState):
+    eqn = self.getEqn(defectState)[1]
+    comp = getKern(self.compositeHess)
+    compositeMinusTime = comp - tf.one_hot(1,2) * comp
+    timeDeriv = tf.math.reduce_sum(tf.math.divide_no_nan(tf.einsum("i,...i->...",compositeMinusTime,eqn),comp[0]),axis=2)
+    return tf.squeeze(timeDeriv)
+
+  def getTrueDQDT(self,x):
+    dxdt = buildTerm(x,termMatrix(self.varCount,self.timeOrder,0,1)) # dx/dt
+    dydt = buildTerm(x,termMatrix(self.varCount,self.timeOrder,1,1)) # dy/dt
+
+    dqdt = tf.expand_dims(tf.stack([dxdt,dydt],axis=-1),-2)
+    return tf.squeeze(dqdt)
+
+  def getEqn(self,x):
+
     lossAmt = 0
+
+    hess11dt = buildTerm(x,termMatrix(self.varCount,self.timeOrder,3,1))
+    hess12dt = buildTerm(x,termMatrix(self.varCount,self.timeOrder,4,1))
+    hess21dt = buildTerm(x,termMatrix(self.varCount,self.timeOrder,5,1))
+    hess22dt = buildTerm(x,termMatrix(self.varCount,self.timeOrder,6,1))
+
+    dHdt = tf.stack([tf.stack([hess11dt,hess12dt],-1),tf.stack([hess21dt,hess22dt],-1)],-1)
+
+    hess11 = buildTerm(x,termMatrix(self.varCount,self.timeOrder,3,0))
+    hess12 = buildTerm(x,termMatrix(self.varCount,self.timeOrder,4,0))
+    hess21 = buildTerm(x,termMatrix(self.varCount,self.timeOrder,5,0))
+    hess22 = buildTerm(x,termMatrix(self.varCount,self.timeOrder,6,0))
+
+    # 11 12
+    # 21 22
+    hessMat = tf.stack([tf.stack([hess11,hess12],-1),tf.stack([hess21,hess22],-1)],-1)
 
     locx = buildTerm(x,termMatrix(self.varCount,self.timeOrder,0,0))
     diffsX = tf.tile(tf.expand_dims(locx,axis=-1),[1,1,locx.shape[1]])
@@ -115,31 +223,110 @@ class SymbolicModel(Model):
     diffsY = tf.tile(tf.expand_dims(locy,axis=-1),[1,1,locy.shape[1]])
     diffsY = diffsY - tf.transpose(diffsY,perm=[0,2,1])
 
+    diffsVec = tf.stack([diffsX,diffsY],axis=-1)
+    diffNorms = tf.einsum("...i,...i->...",diffsVec,diffsVec)
+    poweredNorms = safePow(tf.expand_dims(diffNorms,axis=-1),getKern(self.diffNormExps))
+    # Index labelling:
+    # Us, Other, Jcoordinate, Icoupling
+    directCouplingTerm = tf.einsum("i,...uoi,...uoj->...uoj",getKern(self.diffsCoupling),poweredNorms,diffsVec)
+
+    hessDiffsVec = tf.einsum("...uij,...uoj->...uoi",hessMat,diffsVec)
+    hessPoweredNorms = safePow(tf.expand_dims(diffNorms,axis=-1),getKern(self.diffNormExpsHess))
+    hessCouplingTerm = tf.einsum("i,...uoi,...uoj->...uoj",getKern(self.hessCoupling),hessPoweredNorms,hessDiffsVec)
+
     dxdt = buildTerm(x,termMatrix(self.varCount,self.timeOrder,0,1)) # dx/dt
     dydt = buildTerm(x,termMatrix(self.varCount,self.timeOrder,1,1)) # dy/dt
 
-    matchedDxdt = tf.broadcast_to(tf.expand_dims(dxdt,-1),diffsX.shape)
-    matchedDydt = tf.broadcast_to(tf.expand_dims(dydt,-1),diffsY.shape)
+    dqdt = tf.broadcast_to(tf.expand_dims(tf.stack([dxdt,dydt],axis=-1),-2),diffsVec.shape)
 
-    extraTermTensor = tf.reshape(self.extraTermStorage(tf.constant(1.0,shape=[1,1])),[4,self.varCount,self.timeOrder])
-    extra = [tf.broadcast_to(tf.expand_dims(buildTerm(x,et),-1),diffsX.shape) for et in tf.unstack(extraTermTensor)]
-    composite = tf.stack([matchedDxdt,matchedDydt,diffsX,diffsY] + extra,-1)
+    eqn = tf.stack([dqdt,directCouplingTerm,hessCouplingTerm],-1)
 
-    normTermX = tf.expand_dims(tf.one_hot(0,8),0)
-    normTermY = tf.expand_dims(tf.one_hot(1,8),0)
-    normalizationLoss = tf.abs(200.0 - (self.coeffs(normTermX) * self.coeffs(normTermX) + self.coeffs(normTermY) * self.coeffs(normTermY)))
+    chargeSharingPoweredNorms = safePow(tf.expand_dims(diffNorms,axis=-1),getKern(self.chargeShareExps))
+    chargeSharingTerm = tf.einsum("i,...uoi,...ojk->...ujk",getKern(self.chargeShareCoupling),chargeSharingPoweredNorms,hessMat)
 
-    #sparse1 = tf.expand_dims(tf.convert_to_tensor([0,0,0,1.0]),0)
-    #sparse2 = tf.expand_dims(tf.convert_to_tensor([0,0,1.0,0]),0)
-    #sparse3 = tf.expand_dims(tf.convert_to_tensor([0,1.0,0,0]),0)
-    sparsificationLoss = tf.math.reduce_sum(tf.abs(extraTermTensor),axis = [0,1,2])
+    #biTensorPoweredNorms = safePow(tf.expand_dims(diffNorms,axis=-1),getKern(self.biTensorExps))
+    #biTensorTerm = tf.einsum("...l,...ljk->...jk",tf.einsum("...i,...i->...",getKern(self.biTensorCoupling),biTensorPoweredNorms),diffsVec)
+    #print("hess mat",hessMat.shape)
+    #print("Charge share term",chargeSharingTerm.shape)
 
-    lossAmt = sparsificationLoss + 10 * normalizationLoss + tf.math.reduce_sum(tf.abs(self.coeffs(composite)),axis = [-1,-2])
+    eqnH = tf.stack([dHdt,chargeSharingTerm],-1)
+    return [eqn,eqnH]
+
+  def call(self,x):
+    eqns = self.getEqn(x)
+    eqnq = eqns[0]
+    eqnH = eqns[1]
+
+    residualq = tf.einsum("i,...i->...",getKern(self.composite),eqnq)
+    residualH = tf.einsum("i,...i->...",getKern(self.compositeHess),eqnH)
+
+    # Sum over all charge contributions, then abs, then sum over x and y directions
+    lossAmt = tf.math.reduce_sum(tf.abs(tf.math.reduce_sum(residualq,-2)),-1)
+
+    # Sum over abs(matrix elements)
+    lossAmt += tf.math.reduce_sum(tf.abs(residualH),[-1,-2])
+
+    # Time derivative normalization loss
+    for c in [self.composite,self.compositeHess]:
+      lossAmt += 10. * tf.abs(1.0 - getKern(c)[0])
+
+    for exp in [self.diffNormExps,self.diffNormExpsHess,self.chargeShareExps]:
+      # Unphysical exponent loss
+      lossAmt += 100. * tf.math.reduce_sum(tf.math.maximum(0.,getKern(exp)),axis=-1)
+      # Unsorted exponent loss
+      lossAmt += 100. * tf.math.reduce_sum(tf.math.maximum(0.,sortLossCoeff-tf.experimental.numpy.diff(getKern(exp))),axis=-1)
+
+    for coup in [self.diffsCoupling,self.hessCoupling,self.chargeShareCoupling]:
+      # Coupling normalization loss
+      lossAmt += tf.abs(1. - tf.math.reduce_sum(tf.abs(getKern(coup))))
+      # Coupling sparsification loss
+      lossAmt += tf.math.reduce_sum(0.8 * tf.math.sin(np.math.pi * tf.math.minimum(1.,5. * tf.abs(getKern(coup)))),-1)
 
     return lossAmt
 
+  def printAuxLoss(self):
+    for n,c in [("diff",self.composite),("chrg",self.compositeHess)]:
+      print("Time derivative normalization loss (" + n + ")",tf.abs(1.0 - getKern(c)[0]).numpy())
+
+    for n,e in [("diff",self.diffNormExps),("hess",self.diffNormExpsHess),("chrg",self.chargeShareExps)]:
+      print("Unphysical exponent loss (" + n + ") ",tf.math.reduce_sum(tf.math.maximum(0.,getKern(e)),axis=-1).numpy())
+
+      print("Unsorted exponent loss (" + n + ") ",tf.math.reduce_sum(tf.math.maximum(0.,sortLossCoeff-tf.experimental.numpy.diff(getKern(e))),axis=-1).numpy())
+
+    for n,coup in [("diff",self.diffsCoupling),("hess",self.hessCoupling),("chrg",self.chargeShareCoupling)]:
+      print("Coupling normalization loss (" + n + ") ",tf.abs(1. - tf.math.reduce_sum(tf.abs(getKern(coup)))).numpy())
+      sparseLoss = tf.math.reduce_sum(0.8 * tf.math.sin(np.math.pi * tf.math.minimum(1.,5. * tf.abs(getKern(coup)))),-1)
+      print("Coupling sparsification loss (" + n + ") ",sparseLoss.numpy())
+
+  def explainYourself(self):
+    strOut = "\n{:.3e} dqdt\n{:.3e}[".format(getKern(self.composite)[0].numpy(),getKern(self.composite)[1].numpy())
+    for i in range(getKern(self.diffNormExps).shape[0]):
+      strOut += " {:+.3e} (dq) r^2({:.3e})".format(getKern(self.diffsCoupling)[i].numpy(),getKern(self.diffNormExps)[i].numpy())
+    strOut += "]\n{:.3e}[".format(getKern(self.composite)[2].numpy())
+    for i in range(getKern(self.diffNormExpsHess).shape[0]):
+      strOut += " {:+.3e} (H dq) r^2({:.3e})".format(getKern(self.hessCoupling)[i].numpy(),getKern(self.diffNormExpsHess)[i].numpy())
+    strOut += "]\n\n{:.3e} dHdt\n{:.3e}[".format(getKern(self.compositeHess)[0].numpy(),getKern(self.compositeHess)[1].numpy())
+    for i in range(getKern(self.chargeShareExps).shape[0]):
+      strOut += " {:+.3e} (Hl) r^2({:.3e})".format(getKern(self.chargeShareCoupling)[i].numpy(),getKern(self.chargeShareExps)[i].numpy())
+    strOut += "]\n\n" + self.texport()
+    return strOut
+
+  def texport(self):
+    tex = "\\begin{align*}"
+    tex += "0&= {:+.2f} \\frac{{dq_i}}{{dt}} {:+.4f} (\\Delta q)_{{ij}}\\left[".format(getKern(self.composite)[0].numpy(),getKern(self.composite)[1].numpy())
+    for i in range(getKern(self.diffNormExps).shape[0]):
+      tex += " {:+.2f} \\frac{{1}}{{(r_{{ij}}^2)^{{{:.2f}}}}} ".format(getKern(self.diffsCoupling)[i].numpy(),-getKern(self.diffNormExps)[i].numpy())
+    tex += "\\right] {:+.4f}H_{{jk}}(\\Delta q)_{{ik}}\\left[".format(getKern(self.composite)[2].numpy())
+    for i in range(getKern(self.diffNormExpsHess).shape[0]):
+      tex += " {:+.2f} \\frac{{1}}{{(r_{{ij}}^2)^{{{:.2f}}}}} ".format(getKern(self.hessCoupling)[i].numpy(),-getKern(self.diffNormExpsHess)[i].numpy())
+    tex += "\\right]\\\\ 0&= {:+.2f} \\frac{{dH^k_{{ij}}}}{{dt}} {:+.4f}H^l_{{ij}}\\left[".format(getKern(self.compositeHess)[0].numpy(),getKern(self.compositeHess)[1].numpy())
+    for i in range(getKern(self.chargeShareExps).shape[0]):
+      tex += " {:+.2f} \\frac{{1}}{{(r_{{kl}}^2)^{{{:.2f}}}}} ".format(getKern(self.chargeShareCoupling)[i].numpy(),-getKern(self.chargeShareExps)[i].numpy())
+    tex += "\\right]\\end{align*}"
+    return tex
+
 def dataMatchLoss(x,residuals):
-  return tf.math.reduce_mean(residuals * residuals,axis = [-1,-2])
+  return tf.keras.losses.log_cosh(0,residuals)
 
 def trainThis(model,trainDir,lossFn,getFeat,getLabel,doViz,trainSet,testSet):
   optimizer = tf.keras.optimizers.Adam()
@@ -200,7 +387,7 @@ def trainThis(model,trainDir,lossFn,getFeat,getLabel,doViz,trainSet,testSet):
       if not vized and ((epoch % vizEpochs == 0) or (epoch == EPOCHS - 1)):
         print("\b\"",end="",flush=True)
         doViz(model,test_orig,epoch)
-        #model.save_weights(checkpoint_path.format(epoch=epoch))
+        model.save_weights(checkpoint_path.format(epoch=epoch))
         vized = True
     print()
     print(
@@ -213,11 +400,42 @@ def trainThis(model,trainDir,lossFn,getFeat,getLabel,doViz,trainSet,testSet):
   model.save_weights(checkpoint_path.format(epoch=EPOCHS))
 
 def dontViz(x,y,z):
+  if False:
+    compareModelWithIntegrator(x)
   #print(y[0])
   x(y)[0]
-  print(x.layers[0].get_weights()[0])
-  print(tf.reshape(x.layers[1].get_weights()[0],[4,7,3]))
+  print(x.explainYourself())
+  x.printAuxLoss()
+  #for i in range(len(x.layers)):
+    #print(x.layers[i].get_weights()[0])
   return
+
+def compareModelWithIntegrator(mod):
+  trueTrajectory = sortAlongDefects(list(testTrajDataset.take(1).as_numpy_iterator())[0])
+  trueTrajectoryRed = trueTrajectory[:-2]
+  trueTrajectoryFrames = tf.unstack(trueTrajectory)
+  numFrames = len(trueTrajectoryFrames) - 2
+  predTangents = np.zeros([numFrames,exactDefects,2])
+  trueTangents = np.zeros([numFrames,exactDefects,2])
+  for i in range(numFrames):
+    curTimeSlice = tf.stack(trueTrajectoryFrames[i:3+i],0)
+    dqdt = mod.timeIntegrate(tf.expand_dims(curTimeSlice,0))
+    predTangents[i] = dqdt
+    truedqdt = mod.getTrueDQDT(tf.expand_dims(curTimeSlice,0))
+    trueTangents[i] = truedqdt
+    #print("Predicted ", dqdt)
+    #print("True ", truedqdt)
+    #knownPosition = knownPosition + tf.pad(tf.squeeze(dqdt * 0.01),[[0,0],[0,5]])
+  print("Frames: ",numFrames)
+  for c in range(exactDefects):
+    plt.plot(trueTrajectoryRed[:,c,0],trueTrajectoryRed[:,c,1],'b')
+  tangentScale = 5.
+  for c in range(exactDefects):
+    plt.scatter(tangentScale * trueTangents[:,c,0] + trueTrajectoryRed[:,c,0],tangentScale * trueTangents[:,c,1] + trueTrajectoryRed[:,c,1],marker='x',c='red')
+    plt.scatter(tangentScale * predTangents[:,c,0] + trueTrajectoryRed[:,c,0],tangentScale * predTangents[:,c,1] + trueTrajectoryRed[:,c,1],marker='x',c='green')
+  plt.xlim([0,2 * np.math.pi])
+  plt.ylim([0,2 * np.math.pi])
+  plt.show(block=True)
 
 model = SymbolicModel()
 trainThis(model,"Symbolic",dataMatchLoss,lambda x: x,lambda o: o,dontViz,trainStates,testStates)
